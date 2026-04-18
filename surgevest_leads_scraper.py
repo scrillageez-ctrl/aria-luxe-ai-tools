@@ -11,12 +11,21 @@ Usage:
     python surgevest_leads_scraper.py "restaurants in Miami" --enrich
     python surgevest_leads_scraper.py "law firms in Dallas" --max 30
 
+    # Cloud/server environments are IP-blocked by Google.
+    # Pass a residential proxy to get around this:
+    python surgevest_leads_scraper.py "med spas in Atlanta" --proxy http://user:pass@host:port
+    python surgevest_leads_scraper.py "med spas in Atlanta" --proxy socks5://user:pass@host:port
+
+    # Proxy providers that work well: Oxylabs, Bright Data, Smartproxy, IPRoyal
+    # Set via env var instead of CLI:  export SURGEVEST_PROXY=http://user:pass@host:port
+
 Output: surgevest_leads.csv
 """
 
 import argparse
 import csv
 import json
+import os
 import re
 import random
 import sys
@@ -179,7 +188,7 @@ class Lead:
 
 # ── HTTP Session ───────────────────────────────────────────────────────────────
 
-def make_session() -> requests.Session:
+def make_session(proxy: str | None = None) -> requests.Session:
     s = requests.Session()
     s.headers.update({
         "User-Agent":                random.choice(_USER_AGENTS),
@@ -193,6 +202,9 @@ def make_session() -> requests.Session:
         "Sec-Fetch-Site":            "none",
         "Cache-Control":             "max-age=0",
     })
+    if proxy:
+        s.proxies = {"http": proxy, "https": proxy}
+        print(f"[proxy] routing through {_redact_proxy(proxy)}")
     # Prime the session with a Google homepage visit to get cookies
     try:
         s.get("https://www.google.com/?hl=en", timeout=10)
@@ -202,10 +214,18 @@ def make_session() -> requests.Session:
     return s
 
 
+def _redact_proxy(proxy: str) -> str:
+    """Hide credentials in proxy URL for safe logging."""
+    parsed = urlparse(proxy)
+    if parsed.password:
+        return proxy.replace(parsed.password, "***")
+    return proxy
+
+
 def fetch(session: requests.Session, url: str, retries: int = 3) -> str | None:
     for attempt in range(retries):
         try:
-            resp = session.get(url, timeout=15)
+            resp = session.get(url, timeout=20)
             if resp.status_code == 429:
                 wait = 15 * (attempt + 1)
                 print(f"  [rate-limited] sleeping {wait}s (attempt {attempt + 1}/{retries})...")
@@ -539,6 +559,10 @@ def parse_args() -> argparse.Namespace:
             '  python surgevest_leads_scraper.py "med spas in Atlanta"\n'
             '  python surgevest_leads_scraper.py "restaurants in Miami" --enrich\n'
             '  python surgevest_leads_scraper.py "law firms in Dallas" --max 30\n'
+            '  python surgevest_leads_scraper.py "med spas in Atlanta" --proxy http://user:pass@host:port\n'
+            "\n"
+            "Env vars:\n"
+            "  SURGEVEST_PROXY  residential proxy URL (same as --proxy)\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -555,12 +579,22 @@ def parse_args() -> argparse.Namespace:
         metavar="N",
         help="Cap results at N leads (default: no limit)",
     )
+    p.add_argument(
+        "--proxy",
+        default=os.getenv("SURGEVEST_PROXY"),
+        metavar="URL",
+        help=(
+            "Residential proxy URL — required when running on cloud/server IPs blocked by Google. "
+            "Formats: http://user:pass@host:port  or  socks5://user:pass@host:port. "
+            "Can also be set via the SURGEVEST_PROXY environment variable."
+        ),
+    )
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    session = make_session()
+    session = make_session(proxy=args.proxy)
     all_leads: list[Lead] = []
 
     search_leads = scrape_google_search(session, args.query)
@@ -577,12 +611,21 @@ def main() -> None:
         leads = leads[: args.max]
 
     if not leads:
-        print(
-            "\nNo leads extracted.\n"
-            "Google may be blocking the request or returned no local results.\n"
-            "Tips: wait a few minutes and retry, try a different network, "
-            "or run with --enrich for deeper per-business lookups."
-        )
+        msg = "\nNo leads extracted.\n"
+        if not args.proxy:
+            msg += (
+                "If running on a server/cloud host, Google blocks datacenter IPs.\n"
+                "Re-run with a residential proxy:\n"
+                "  --proxy http://user:pass@host:port\n"
+                "  or set the SURGEVEST_PROXY environment variable.\n"
+            )
+        else:
+            msg += (
+                "Proxy is set but Google still returned no results.\n"
+                "Check that your proxy URL is correct and the proxy is active.\n"
+            )
+        msg += "Other tips: wait a few minutes and retry, or use --enrich for deeper lookups."
+        print(msg)
         sys.exit(1)
 
     if args.enrich:
