@@ -1,6 +1,6 @@
 """
 surgevest_leads_scraper.py
-Scrapes Google Search + Google Maps for local business leads.
+Scrapes Google Search, Google Maps, AND Yelp for local business leads.
 No API key required — uses requests + BeautifulSoup.
 
 Dependencies:
@@ -9,15 +9,15 @@ Dependencies:
 Usage:
     python surgevest_leads_scraper.py "med spas in Atlanta"
     python surgevest_leads_scraper.py "restaurants in Miami" --enrich
-    python surgevest_leads_scraper.py "law firms in Dallas" --max 30
+    python surgevest_leads_scraper.py "law firms in Dallas" --max 30 --pages 5
+    python surgevest_leads_scraper.py "med spas in Atlanta" --no-variants
 
     # Cloud/server environments are IP-blocked by Google.
     # Pass a residential proxy to get around this:
     python surgevest_leads_scraper.py "med spas in Atlanta" --proxy http://user:pass@host:port
     python surgevest_leads_scraper.py "med spas in Atlanta" --proxy socks5://user:pass@host:port
 
-    # Proxy providers that work well: Oxylabs, Bright Data, Smartproxy, IPRoyal
-    # Set via env var instead of CLI:  export SURGEVEST_PROXY=http://user:pass@host:port
+    # Set proxy via env var:  export SURGEVEST_PROXY=http://user:pass@host:port
 
 Output: surgevest_leads.csv
 """
@@ -85,6 +85,93 @@ _BUSINESS_TYPES = {
     "Physician", "Restaurant", "FoodEstablishment", "LegalService",
     "FinancialService", "AutoRepair", "Store", "Organization",
 }
+
+# ── Query Variant Generation ───────────────────────────────────────────────────
+
+# Maps niche keywords to extra search terms that surface more businesses.
+# Each tuple: (trigger keywords, list of variant templates).
+# {niche} and {city} are substituted at runtime.
+_NICHE_VARIANTS: list[tuple[tuple[str, ...], list[str]]] = [
+    (
+        ("med spa", "medspa", "medical spa", "aesthetics"),
+        [
+            "medical aesthetics in {city}",
+            "botox and fillers in {city}",
+            "laser skin treatment in {city}",
+            "aesthetic clinic in {city}",
+            "cosmetic clinic in {city}",
+        ],
+    ),
+    (
+        ("salon", "hair salon", "beauty salon", "hair care"),
+        [
+            "hair salon in {city}",
+            "beauty salon in {city}",
+            "barber shop in {city}",
+            "nail salon in {city}",
+        ],
+    ),
+    (
+        ("restaurant", "dining", "food", "eatery"),
+        [
+            "best restaurants in {city}",
+            "local dining in {city}",
+            "top rated food in {city}",
+        ],
+    ),
+    (
+        ("gym", "fitness", "workout"),
+        [
+            "personal training in {city}",
+            "fitness center in {city}",
+            "yoga studio in {city}",
+        ],
+    ),
+    (
+        ("dentist", "dental"),
+        [
+            "dental office in {city}",
+            "cosmetic dentist in {city}",
+            "teeth whitening in {city}",
+        ],
+    ),
+    (
+        ("lawyer", "attorney", "law firm"),
+        [
+            "law office in {city}",
+            "legal services in {city}",
+            "attorney near {city}",
+        ],
+    ),
+    (
+        ("real estate",),
+        [
+            "real estate agent in {city}",
+            "property management in {city}",
+            "realtor in {city}",
+        ],
+    ),
+]
+
+
+def generate_query_variants(query: str) -> list[str]:
+    """Return the original query plus niche-specific related search terms."""
+    q = query.lower()
+    parts = q.split(" in ", 1)
+    niche = parts[0].strip()
+    city  = parts[1].strip() if len(parts) > 1 else ""
+
+    variants: list[str] = [query]
+    for triggers, templates in _NICHE_VARIANTS:
+        if any(t in niche for t in triggers):
+            for tmpl in templates:
+                v = tmpl.format(niche=niche, city=city)
+                if v not in variants:
+                    variants.append(v)
+            break  # only apply the first matching group
+
+    return variants
+
 
 # ── Call Window Logic ──────────────────────────────────────────────────────────
 
@@ -312,96 +399,109 @@ def jsonld_to_lead(item: dict, query: str) -> Lead:
 
 # ── Google Search Local Results ────────────────────────────────────────────────
 
-def scrape_google_search(session: requests.Session, query: str) -> list[Lead]:
+def scrape_google_search(session: requests.Session, query: str, pages: int = 3) -> list[Lead]:
     """
-    Fetch Google's local search tab (?tbm=lcl) and parse business listings.
+    Fetch Google's local search tab (?tbm=lcl) across multiple pages.
     Tries JSON-LD structured data first, then falls back to HTML card parsing.
     """
-    url = f"https://www.google.com/search?q={quote_plus(query)}&tbm=lcl&hl=en&gl=us&num=20"
-    print(f"\n[Google Search] {url}")
-    html = fetch(session, url)
-    if not html:
-        return []
-
-    soup = BeautifulSoup(html, "lxml")
-
-    # Strategy A — JSON-LD (cleanest when present)
-    jsonld_items = parse_jsonld(soup)
-    if jsonld_items:
-        leads = [jsonld_to_lead(i, query) for i in jsonld_items if i.get("name")]
-        print(f"  [json-ld] {len(leads)} businesses found")
-        return leads
-
-    # Strategy B — HTML card parsing with multiple selector fallbacks
-    # Google's local result cards use obfuscated class names that change over time.
-    CARD_SELECTORS = [
-        "[data-cid]",
-        ".VkpGBb",
-        ".rllt__details",
-        ".uMdZh",
-        "div[class*='lqhpac']",
-    ]
-    cards: list = []
-    for sel in CARD_SELECTORS:
-        found = soup.select(sel)
-        if found:
-            cards = found
-            print(f"  [html:{sel}] {len(cards)} cards found")
-            break
-
-    if not cards:
-        # Last resort: elements with aria-label that look like business names
-        cards = [
-            el for el in soup.find_all(True, {"aria-label": True})
-            if 3 < len(el.get("aria-label", "")) < 80
-        ]
-        print(f"  [html:aria-label fallback] {len(cards)} candidates")
-
-    leads: list[Lead] = []
+    all_leads: list[Lead] = []
     seen: set[str] = set()
 
-    for card in cards:
-        text = card.get_text(" ", strip=True)
-
-        # Name: heading role > h-tag > bold > aria-label
-        name_el = (
-            card.find(attrs={"role": "heading"})
-            or card.find(["h3", "h2", "h1"])
-            or card.find(["b", "strong"])
+    for page in range(pages):
+        start = page * 20
+        url = (
+            f"https://www.google.com/search"
+            f"?q={quote_plus(query)}&tbm=lcl&hl=en&gl=us&num=20&start={start}"
         )
-        name = name_el.get_text(strip=True) if name_el else card.get("aria-label", "").strip()
-        if not name or name.lower() in seen:
+        print(f"\n[Google Search p{page + 1}] {url}")
+        html = fetch(session, url)
+        if not html:
+            break
+
+        soup = BeautifulSoup(html, "lxml")
+
+        # Strategy A — JSON-LD (cleanest when present)
+        jsonld_items = parse_jsonld(soup)
+        if jsonld_items:
+            page_leads = [jsonld_to_lead(i, query) for i in jsonld_items if i.get("name")]
+            new = [l for l in page_leads if l.key not in seen]
+            seen.update(l.key for l in new)
+            all_leads.extend(new)
+            print(f"  [json-ld] {len(new)} new businesses")
+            if not new:
+                break  # no new results on this page — stop paginating
+            if page < pages - 1:
+                _sleep(2.0, 3.5)
             continue
-        seen.add(name.lower())
 
-        # Website: unwrap any Google redirect links in this card
-        website = ""
-        for a in card.find_all("a", href=True):
-            w = unwrap_google_url(a["href"])
-            if w:
-                website = w
+        # Strategy B — HTML card parsing with multiple selector fallbacks
+        CARD_SELECTORS = [
+            "[data-cid]",
+            ".VkpGBb",
+            ".rllt__details",
+            ".uMdZh",
+            "div[class*='lqhpac']",
+        ]
+        cards: list = []
+        for sel in CARD_SELECTORS:
+            found = soup.select(sel)
+            if found:
+                cards = found
+                print(f"  [html:{sel}] {len(cards)} cards found")
                 break
 
-        # Business type: short span with no digits
-        btype = ""
-        for span in card.find_all("span"):
-            t = span.get_text(strip=True)
-            if t and len(t) < 40 and not any(c.isdigit() for c in t):
-                btype = t
-                break
+        if not cards:
+            cards = [
+                el for el in soup.find_all(True, {"aria-label": True})
+                if 3 < len(el.get("aria-label", "")) < 80
+            ]
+            print(f"  [html:aria-label fallback] {len(cards)} candidates")
 
-        lead = Lead(
-            business_name = name,
-            phone_number  = extract_phone(text),
-            address       = extract_address(text),
-            website       = website,
-            business_type = btype,
-        )
-        lead.call_window = infer_call_window(btype, query)
-        leads.append(lead)
+        page_new = 0
+        for card in cards:
+            text = card.get_text(" ", strip=True)
+            name_el = (
+                card.find(attrs={"role": "heading"})
+                or card.find(["h3", "h2", "h1"])
+                or card.find(["b", "strong"])
+            )
+            name = name_el.get_text(strip=True) if name_el else card.get("aria-label", "").strip()
+            if not name or name.lower() in seen:
+                continue
+            seen.add(name.lower())
 
-    print(f"  [html] {len(leads)} businesses extracted")
-    return leads
+            website = ""
+            for a in card.find_all("a", href=True):
+                w = unwrap_google_url(a["href"])
+                if w:
+                    website = w
+                    break
+
+            btype = ""
+            for span in card.find_all("span"):
+                t = span.get_text(strip=True)
+                if t and len(t) < 40 and not any(c.isdigit() for c in t):
+                    btype = t
+                    break
+
+            lead = Lead(
+                business_name = name,
+                phone_number  = extract_phone(text),
+                address       = extract_address(text),
+                website       = website,
+                business_type = btype,
+            )
+            lead.call_window = infer_call_window(btype, query)
+            all_leads.append(lead)
+            page_new += 1
+
+        print(f"  [html] {page_new} new businesses extracted")
+        if not page_new:
+            break
+        if page < pages - 1:
+            _sleep(2.0, 3.5)
+
+    return all_leads
 
 
 # ── Google Maps Search ─────────────────────────────────────────────────────────
@@ -472,6 +572,116 @@ def scrape_google_maps(session: requests.Session, query: str) -> list[Lead]:
 
     print(f"  [aria-label] {len(leads)} business candidates found")
     return leads
+
+
+# ── Yelp Scraper ───────────────────────────────────────────────────────────────
+
+def scrape_yelp(session: requests.Session, query: str, pages: int = 3) -> list[Lead]:
+    """
+    Scrape Yelp search results for the given query.
+    Yelp includes JSON-LD on its search pages and is generally less aggressive
+    about blocking than Google, making it a reliable supplementary source.
+    """
+    parts = query.lower().split(" in ", 1)
+    niche    = parts[0].strip()
+    location = parts[1].strip() if len(parts) > 1 else ""
+
+    all_leads: list[Lead] = []
+    seen: set[str] = set()
+
+    for page in range(pages):
+        start = page * 10
+        url = (
+            f"https://www.yelp.com/search"
+            f"?find_desc={quote_plus(niche)}"
+            f"&find_loc={quote_plus(location)}"
+            f"&start={start}"
+        )
+        print(f"\n[Yelp p{page + 1}] {url}")
+        html = fetch(session, url)
+        if not html:
+            break
+
+        soup = BeautifulSoup(html, "lxml")
+
+        # Strategy A — JSON-LD (Yelp reliably includes this)
+        jsonld_items = parse_jsonld(soup)
+        page_new = 0
+        if jsonld_items:
+            for item in jsonld_items:
+                if not item.get("name"):
+                    continue
+                lead = jsonld_to_lead(item, query)
+                if lead.key in seen:
+                    continue
+                seen.add(lead.key)
+                all_leads.append(lead)
+                page_new += 1
+            print(f"  [json-ld] {page_new} new businesses")
+            if not page_new:
+                break
+            if page < pages - 1:
+                _sleep(2.0, 3.5)
+            continue
+
+        # Strategy B — Yelp business result cards
+        # Yelp wraps each result in an <li> with structured content
+        cards = (
+            soup.select("li[class*='businessResult']") or
+            soup.select("div[class*='businessResult']") or
+            soup.select("h3 a[href*='/biz/']") or       # business name links
+            soup.select("a[href*='/biz/']")
+        )
+        print(f"  [html] {len(cards)} cards found")
+
+        for card in cards:
+            # For link-only selectors, walk up to the containing block
+            if card.name == "a":
+                name = card.get_text(strip=True)
+                card = card.find_parent("li") or card.find_parent("div") or card
+            else:
+                name_el = card.find("a", href=lambda h: h and "/biz/" in h)
+                name = name_el.get_text(strip=True) if name_el else ""
+
+            if not name or name.lower() in seen:
+                continue
+            seen.add(name.lower())
+
+            text = card.get_text(" ", strip=True)
+
+            # Website: Yelp business pages have the site in the detail
+            website = ""
+            for a in card.find_all("a", href=True):
+                w = unwrap_google_url(a["href"])
+                if w and "yelp.com" not in w:
+                    website = w
+                    break
+
+            btype = ""
+            for span in card.find_all(["span", "p"]):
+                t = span.get_text(strip=True)
+                if t and 3 < len(t) < 40 and not any(c.isdigit() for c in t):
+                    btype = t
+                    break
+
+            lead = Lead(
+                business_name = name,
+                phone_number  = extract_phone(text),
+                address       = extract_address(text),
+                website       = website,
+                business_type = btype,
+                call_window   = infer_call_window(btype, query),
+            )
+            all_leads.append(lead)
+            page_new += 1
+
+        print(f"  [html] {page_new} new businesses extracted")
+        if not page_new:
+            break
+        if page < pages - 1:
+            _sleep(2.0, 3.5)
+
+    return all_leads
 
 
 # ── Per-Lead Enrichment ────────────────────────────────────────────────────────
@@ -554,11 +764,11 @@ def save_csv(leads: list[Lead]) -> None:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
-            "Scrape Google Search + Google Maps for local business leads (no API key).\n\n"
+            "Scrape Google Search, Google Maps, and Yelp for local business leads (no API key).\n\n"
             "Examples:\n"
             '  python surgevest_leads_scraper.py "med spas in Atlanta"\n'
             '  python surgevest_leads_scraper.py "restaurants in Miami" --enrich\n'
-            '  python surgevest_leads_scraper.py "law firms in Dallas" --max 30\n'
+            '  python surgevest_leads_scraper.py "law firms in Dallas" --max 30 --pages 5\n'
             '  python surgevest_leads_scraper.py "med spas in Atlanta" --proxy http://user:pass@host:port\n'
             "\n"
             "Env vars:\n"
@@ -567,6 +777,18 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("query", help='Search query, e.g. "med spas in Atlanta"')
+    p.add_argument(
+        "--pages",
+        type=int,
+        default=3,
+        metavar="N",
+        help="Number of result pages to scrape per source (default: 3, ~60 Google + 30 Yelp results)",
+    )
+    p.add_argument(
+        "--no-variants",
+        action="store_true",
+        help="Skip auto-generated query variations — only search the exact query provided",
+    )
     p.add_argument(
         "--enrich",
         action="store_true",
@@ -597,12 +819,27 @@ def main() -> None:
     session = make_session(proxy=args.proxy)
     all_leads: list[Lead] = []
 
-    search_leads = scrape_google_search(session, args.query)
-    all_leads.extend(search_leads)
-    _sleep(2.0, 4.0)
+    queries = [args.query] if args.no_variants else generate_query_variants(args.query)
+    if len(queries) > 1:
+        print(f"[variants] searching {len(queries)} query variations:")
+        for q in queries:
+            print(f"  • {q}")
 
+    # ── Google Search (all query variants, paginated) ──────────────────────────
+    for q in queries:
+        leads = scrape_google_search(session, q, pages=args.pages)
+        all_leads.extend(leads)
+        _sleep(2.0, 4.0)
+
+    # ── Google Maps (primary query only) ──────────────────────────────────────
     maps_leads = scrape_google_maps(session, args.query)
     all_leads.extend(maps_leads)
+    _sleep(2.0, 4.0)
+
+    # ── Yelp (primary query, paginated) ───────────────────────────────────────
+    yelp_leads = scrape_yelp(session, args.query, pages=args.pages)
+    all_leads.extend(yelp_leads)
+    print(f"\n[Yelp total] {len(yelp_leads)} businesses")
 
     leads = deduplicate(all_leads)
     leads = [l for l in leads if l.business_name]
